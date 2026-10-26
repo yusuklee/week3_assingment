@@ -1,0 +1,12 @@
+# 데이터 (Kaggle 에서 직접 다운로드: README 참고)
+data/*.csv
+data/*.zip
+
+# 실행 산출물
+failed_messages.jsonl
+*.log
+
+# python
+__pycache__/
+*.pyc
+.venv/
