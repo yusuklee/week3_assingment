@@ -83,14 +83,7 @@ CSV 읽기 -> 시간순 정렬 ->  (속도 제어: sleep) ->  JSON 직렬화 -> 
                                                                                            ├─ 성공: ok 카운트, 처음 3건은 partition/offset 로그
                                                                                            └─ 실패: fail 카운트, failed_messages.jsonl 에 기록
 ```
-| 단계 | 내용                                                                                                                                |
-|---|-----------------------------------------------------------------------------------------------------------------------------------|
-| 데이터 읽기 | pandas로 `events.csv` 로드 -> `timestamp` 기준 정렬 (원본 CSV는 시간순이 아님). `--offset`, `--limit`으로 구간 선택                                     |
-| 속도 제어 | `--speed N`: 원본 이벤트 간 간격을 N배속으로 재생 (0 = 최대 속도). `--rate N`: 초당 N건 고정 전송 (로드 테스트용, `--speed` 무시)                                   |
-| 직렬화 | 행 1개 -> 공통 껍데기(event_id · event_type · event_time · produced_at · schema_version · source) + payload. `event_id`는 원본에 없어서 UUID 생성 |
-| 전송 | `produce(topic, key=visitorid, value=json)`. 로컬 버퍼가 꽉 차면(`BufferError`) `poll()`로 콜백을 처리하며 대기                                     |
-| 콜백 | 브로커 ack 시점에 호출. 실패 시 로그 + `failed_messages.jsonl`에 key/value/에러 기록 (재전송용)                                                         |
-| 종료 | `flush(30)`으로 남은 메시지 전송 완료 대기 후 집계 출력                                                                                             |
+![producer_flow.png](docs/producer_flow.png)
 
 **Producer 설정**
 
@@ -109,7 +102,7 @@ key = `"1149227"` (visitorid)
 ```json
 {
   "event_id": "bf7a5319-89f5-45d6-b21a-758d81e99189",
-  "event_type": "view",
+  "event_type": "view",  
   "event_time": "2015-05-03T03:00:27.031Z",
   "produced_at": "2026-10-26T02:33:54.794Z",
   "schema_version": 1,
@@ -120,6 +113,8 @@ key = `"1149227"` (visitorid)
     "transaction_id": null
   }
 }
+
+
 ```
 
 
