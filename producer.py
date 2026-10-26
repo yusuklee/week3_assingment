@@ -64,7 +64,10 @@ def build_message(row) -> tuple[str, dict]:
     tx = row.transactionid
     key = str(int(row.visitorid))
     value = {
-        "event_id": str(uuid.uuid4()),            # 중복 제거 · 멱등 저장 기준 (원본엔 없어서 생성기가 부여)
+        # 중복 제거 · 멱등 저장 기준. 원본엔 없어서 생성기가 부여하는데, 랜덤(uuid4)이면 리플레이를 다시 돌릴 때
+        # 같은 행이 다른 ID를 받아 중복 제거가 안 된다. 행 내용(timestamp·visitorid·event·itemid)을 해시해서
+        # 같은 행 → 항상 같은 ID 가 나오게 한다. (같은 ms 에 한 유저가 여러 상품을 본 행이 있어 itemid 까지 포함)
+        "event_id": str(uuid.uuid5(uuid.NAMESPACE_OID, f"{int(row.timestamp)}|{int(row.visitorid)}|{row.event}|{int(row.itemid)}")),
         "event_type": row.event,                   # view | addtocart | transaction
         "event_time": ms_to_iso(int(row.timestamp)),  # 원본 발생 시각 → 윈도우 집계 기준
         "produced_at": now_iso(),                  # 생성기가 보낸 시각 → end-to-end 지연 측정 기준
