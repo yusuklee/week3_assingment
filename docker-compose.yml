@@ -12,8 +12,8 @@ services:
       CLUSTER_ID: ecommerce-clickstream-0001
 
       # 리스너 3개
-      #  - PLAINTEXT 9092  : 내 PC(host)의 producer.py / consumer.py 가 localhost:9092 로 접속
-      #  - INTERNAL 29092  : 같은 compose 네트워크의 다른 컨테이너(Spark, Airflow)가 kafka:29092 로 접속
+      #  - PLAINTEXT 9092  : 내 PC(host)의 producer.py / consumer.py / preprocess.py 가 localhost:9092 로 접속
+      #  - INTERNAL 29092  : 같은 compose 네트워크의 다른 컨테이너(Airflow 등)가 kafka:29092 로 접속
       #  - CONTROLLER 9093 : KRaft 컨트롤러 내부 통신
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,INTERNAL://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,INTERNAL://kafka:29092
@@ -40,5 +40,25 @@ services:
       timeout: 5s
       retries: 10
 
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: clickstream
+      POSTGRES_PASSWORD: clickstream   # 로컬 실습용. 운영이면 .env 로 분리
+      POSTGRES_DB: clickstream
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # 컨테이너가 처음 뜰 때(볼륨이 비어 있을 때) 한 번만 실행돼서 테이블을 만든다
+      - ./schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U clickstream -d clickstream"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
 volumes:
   kafka_data:
+  postgres_data:

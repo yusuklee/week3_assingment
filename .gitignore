@@ -10,3 +10,7 @@ failed_messages.jsonl
 __pycache__/
 *.pyc
 .venv/
+
+# Spark 산출물
+checkpoint/
+data/parquet/

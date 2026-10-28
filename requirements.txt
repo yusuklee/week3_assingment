@@ -1,2 +1,5 @@
 confluent-kafka>=2.5
 pandas>=2.0
+pyspark==3.5.3
+pyarrow
+psycopg2-binary
