@@ -155,10 +155,19 @@ INFO DONE sent=1000 ok=1000 fail=0 unflushed=0 elapsed=5.0s avg=200 msg/s
 
 
 ---
-## 5. 전처리 · 저장 (4회차)
+## 5. 전처리 · 저장
 
-Kafka `user-events` → Spark Structured Streaming(`preprocess.py`) → Parquet(원본 보관) + PostgreSQL(조회용).
-처리 흐름 · 입출력 예시 · 최종 스키마 · 저장 포맷 선택 이유는 `docs/4회차_전처리_저장.pdf` 참고.
+Kafka `user-events` → Spark Structured Streaming(`preprocess.py`) → Parquet(전체 이력 보관) + PostgreSQL(최근 30일, 조회용).
+처리 흐름 · 입출력 예시 · 최종 스키마 · 저장 포맷 선택 이유는 `docs/전처리_저장.pdf` 참고.
+
+**두 저장소의 역할**
+
+| 저장소 | 보관 범위 | 역할 |
+|---|---|---|
+| Parquet `data/parquet/events/dt=…` | 전체. 지우지 않음 | 원본 이력. 집계 로직을 고쳐 재처리하거나 과거 구간을 분석할 때 여기서 읽는다 |
+| PostgreSQL `events`, `item_stats_1m` | 가장 최근 이벤트 기준 30일 (`--pg-retention-days`) | 조회용. 유저별 · 아이템별 인덱스, API 가 읽는 곳. 배치마다 기간 밖 행을 삭제해 가볍게 유지 |
+
+보관 기준이 `now()` 가 아니라 "저장된 가장 최근 이벤트 시각" 인 이유: 2015년 로그를 리플레이하는 중이라 `now()` 기준이면 전부 지워진다. 실시간 수집이면 둘이 같다.
 
 ### 5-1. 실행 방법
 
@@ -170,17 +179,18 @@ pip install -r requirements.txt
 docker compose up -d
 python create_topics.py                       # user-events, user-events-dlq
 
-# 2) 수집 (3회차)
-python producer.py --limit 20000 --speed 0    # CSV 리플레이 → Kafka
+# 2) 수집
+python producer.py --limit 919497 --speed 0   # CSV 앞 45일치 리플레이 → Kafka (24초)
 python consumer.py --max 5                    # 들어갔는지 눈으로 확인
 
-# 3) 전처리 · 저장 (4회차)
-python preprocess.py                          # 지금까지 쌓인 메시지를 전부 처리하고 종료 (trigger availableNow)
+# 3) 전처리 · 저장
+python preprocess.py                          # 쌓인 메시지를 전부 처리하고 종료 (trigger availableNow)
 python preprocess.py --continuous             # 1분마다 micro-batch 를 계속 돌림 (Ctrl+C 종료)
 python preprocess.py --reset                  # 체크포인트 삭제 후 토픽 처음부터 재처리 (재실행 테스트용)
+python preprocess.py --pg-retention-days 7    # PostgreSQL 보관 기간 변경 (기본 30)
 
 # 4) 결과 조회
-docker exec postgres psql -U clickstream -d clickstream -c "select event_type, count(*) from events group by 1;"
+docker exec postgres psql -U clickstream -d clickstream -c "select min(event_time)::date, max(event_time)::date, count(*) from events;"
 docker exec postgres psql -U clickstream -d clickstream -c "select * from item_stats_1m order by view_cnt desc limit 5;"
 docker exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic user-events-dlq --from-beginning --timeout-ms 5000
 ```
@@ -191,38 +201,40 @@ docker exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server lo
 
 | 구분 | 위치 | 형식 | 비고 |
 |---|---|---|---|
-| 입력 | Kafka `user-events` (`localhost:9092`) | JSON 메시지, key = visitor_id | 3회차 producer 가 쌓은 것 |
+| 입력 | Kafka `user-events` (`localhost:9092`) | JSON 메시지, key = visitor_id | producer.py 가 쌓은 것 |
 | 진행 위치 | `checkpoint/preprocess/` | Spark 체크포인트 (Kafka offset) | 지우면 처음부터 다시 읽음 |
-| 출력 ① 원본 보관 | `data/parquet/events/dt=YYYY-MM-DD/*.parquet` | Parquet, 날짜 파티션, append | 재처리 입력 · 영구 보관 |
-| 출력 ② 조회용 | PostgreSQL `localhost:5432` db `clickstream` (user/pw `clickstream`) | `events`, `item_stats_1m` 테이블 | `events_staging` 은 배치 적재용 임시 테이블 |
+| 출력 ① 전체 이력 | `data/parquet/events/dt=YYYY-MM-DD/*.parquet` | Parquet, 날짜 파티션, append | 지우지 않음. 재처리 입력 |
+| 출력 ② 조회용 | PostgreSQL `localhost:5432` db `clickstream` (user/pw `clickstream`) | `events`, `item_stats_1m` 테이블 | 최근 30일만. `events_staging` 은 배치 적재용 임시 테이블 |
 | 출력 ③ 실패 격리 | Kafka `user-events-dlq` | 원문 + `dlq_reason` + partition/offset | 파싱 · 검증 실패 메시지 |
 
-**실제 실행 결과** (Kafka 에 쌓여 있던 23,000건)
+**실제 실행 결과** (CSV 앞 45일치 919,497건을 Kafka 에 넣고 한 번에 처리)
 
 ```
-INFO batch=0 kafka=23000 parsed_ok=23000 dlq=0 dedup=23000(-0) | pg inserted=23000 skipped_existing=0 stats_upsert=22194 | parquet=data/parquet/events | 7.5s
+INFO batch=0 kafka=919497 parsed_ok=919497 dlq=0 dedup=919381(-116) | pg inserted=919381 skipped_existing=0 stats_upsert=887413 | retention(30d, latest=2015-06-17 03:00:01.600000+00:00) deleted events=301050 stats=290728 | parquet=data/parquet/events | 62.5s
 INFO DONE 쌓인 메시지 처리 완료
 ```
 
 | 확인 | 결과 |
 |---|---|
-| `events` 건수 / 종류 | 23,000 (view 22,354 · addtocart 523 · transaction 123), 2015-05-03 03:00 ~ 05-04 15:34 UTC |
-| `item_stats_1m` | 22,194행, 합계가 events 와 일치 (views 22,354 / carts 523 / tx 123) |
-| Parquet | `dt=2015-05-03` 8파일, `dt=2015-05-04` 8파일, 23,000행 |
-| 깨진 메시지 2건 주입 | `dlq=2` → `user-events-dlq` 에 `invalid_json`, `bad_event_type` 이유와 함께 격리, events 에는 안 들어감 |
+| 중복 제거 | 원본 CSV 에 완전히 같은 행이 116건 있어 `event_id` 가 같음 → 하나만 남김 (919,497 → 919,381) |
+| Parquet (전체) | 2015-05-03 ~ 06-17, 46일, 919,381행, 738파일, 54MB |
+| PostgreSQL `events` (최근 30일) | 2015-05-18 ~ 06-17, 618,331행 (view 598,704 · addtocart 14,807 · transaction 4,820). 기간 밖 301,050행 삭제됨 |
+| PostgreSQL `item_stats_1m` | 596,685행, 같은 기간 |
+| 깨진 메시지 주입 테스트 | JSON 아님 · `event_type=purchase` 2건 → `dlq=2`, `user-events-dlq` 에 `invalid_json`, `bad_event_type` 이유와 함께 격리 |
 
-**같은 입력을 다시 처리하면**
+**같은 입력을 다시 처리하면** (23,000건으로 검증)
 
 | 상황 | 결과 |
 |---|---|
 | 그냥 다시 실행 (체크포인트 유지) | 새 offset 이 없어서 아무것도 처리 안 함. 저장 결과 변화 없음 |
-| `--reset` 으로 처음부터 재처리 | `pg inserted=0 skipped_existing=23000`. `events` 는 PK 로 23,000 그대로, `item_stats_1m` 은 재계산이라 내용 md5 가 전후 동일 |
-| 단, Parquet | append 라 23,000 → 46,000행 (distinct event_id 는 23,000). 아래 남은 문제 |
+| `--reset` 으로 처음부터 재처리 | `pg inserted=0 skipped_existing=23000`. `events` 는 PK 로 그대로, `item_stats_1m` 은 재계산이라 내용 md5 가 전후 동일 |
+| 단, Parquet | append 라 행이 두 배 (distinct event_id 는 그대로). 아래 남은 문제 |
 
 ### 5-3. 남은 문제
 
 - **Parquet 재처리 중복.** 체크포인트를 지우고 다시 돌리면 같은 이벤트가 파일로 또 쌓인다. 읽는 쪽에서 `event_id` 로 중복 제거하거나, 배치별 폴더에 쓰고 주기적으로 compaction 하는 쪽으로 정리 필요. DLQ 도 같은 이유로 재처리 때 다시 쌓인다.
+- **Parquet → PostgreSQL 되돌리기(backfill) 가 아직 없다.** 30일 밖 구간을 조회하려면 Parquet 에서 그 날짜 파티션만 읽어 `events` 에 upsert 하고 집계를 다시 계산하는 스크립트가 필요하다. `load_to_postgres` 를 그대로 재사용하면 된다.
 - **`acks=all` 이 단일 브로커에선 의미가 없다.** 복제 계수 1이라 브로커 1대가 죽으면 Kafka 에 있는 데이터는 사라진다. 로컬 실습 한계. Parquet 이 그래서 필요하다.
-- **1분 집계 재계산 비용.** 배치가 건드린 윈도우만 `events` 에서 다시 세는 방식이라 정확하지만, 배속을 올려 한 배치에 수천 개 윈도우가 들어오면 그만큼 느려진다. 6회차 로드 테스트에서 측정.
-- **아직 없는 테이블.** `item_cooccur`(함께 본 상품), `recommendations`(유저별 Top-N) 는 Airflow 일배치(5회차) 몫. 스트리밍에서 30분 세션 self-join 은 상태가 커져서 배치로 뺐다.
+- **1분 집계 재계산 비용.** 배치가 건드린 윈도우만 `events` 에서 다시 세는 방식이라 정확하지만, 한 배치에 윈도우가 많이 들어오면 그만큼 느려진다 (45일치 한 번에: 집계 upsert 887,413행 포함 62초). 로드 테스트에서 측정.
+- **아직 없는 테이블.** `item_cooccur`(함께 본 상품), `recommendations`(유저별 Top-N) 는 Airflow 일배치 몫. 스트리밍에서 30분 세션 self-join 은 상태가 커져서 배치로 뺐다.
 - **환경.** pyspark 3.5.3 은 Python 3.13 에서 워커가 죽어서 3.10 으로 실행. Windows 에서 Spark 종료 시 `snappy-java.jar 삭제 실패` 경고가 뜨는데 임시 파일 정리 문제라 결과에는 영향 없음.

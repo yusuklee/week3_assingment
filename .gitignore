@@ -14,3 +14,6 @@ __pycache__/
 # Spark 산출물
 checkpoint/
 data/parquet/
+
+# Word 임시 잠금 파일
+~$*

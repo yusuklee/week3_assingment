@@ -7,6 +7,11 @@
                                                                  → PostgreSQL events_staging (JDBC overwrite)
                                                                  → events 로 INSERT ... ON CONFLICT DO NOTHING (멱등)
                                                                  → 이번 배치가 건드린 1분 윈도우만 item_stats_1m 재계산 upsert
+                                                                 → 가장 최근 이벤트 기준 N일(기본 30) 지난 행은 PostgreSQL 에서 삭제
+
+저장소 역할:
+  - Parquet     : 전체 이력. 지우지 않는다. 재처리 · 과거 분석용
+  - PostgreSQL  : 최근 N일만. 조회(API)용. --pg-retention-days 로 조절
 
 재실행 동작:
   - 체크포인트(checkpoint/preprocess)에 Kafka offset 이 기록돼서, 다시 실행하면 지난번 이후 메시지만 읽는다.
@@ -157,7 +162,28 @@ ON CONFLICT (window_start, item_id) DO UPDATE SET
 """
 
 
-def load_to_postgres(good: DataFrame) -> dict:
+# PostgreSQL 은 조회용이라 최근 N일만 둔다. 전체 이력은 Parquet 이 가진다.
+# 기준은 now() 가 아니라 "저장된 가장 최근 이벤트 시각" — 2015년 로그를 리플레이하는 중이라 now() 기준이면 전부 지워진다.
+# (운영에서 실시간 수집이면 latest ≈ now() 라 결과는 같다)
+DELETE_OLD = """
+WITH latest AS (
+    SELECT max(event_time) AS t FROM events
+),
+d1 AS (
+    DELETE FROM events
+    WHERE event_time < (SELECT t FROM latest) - make_interval(days => %(days)s)
+    RETURNING 1
+),
+d2 AS (
+    DELETE FROM item_stats_1m
+    WHERE window_start < date_trunc('minute', (SELECT t FROM latest) - make_interval(days => %(days)s))
+    RETURNING 1
+)
+SELECT (SELECT count(*) FROM d1), (SELECT count(*) FROM d2), (SELECT t FROM latest);
+"""
+
+
+def load_to_postgres(good: DataFrame, retention_days: int) -> dict:
     # Spark → staging (JDBC). overwrite + truncate 라 테이블 정의는 유지되고 내용만 바뀐다
     (good.write.format("jdbc")
          .option("url", PG_JDBC_URL)
@@ -175,9 +201,13 @@ def load_to_postgres(good: DataFrame) -> dict:
         inserted = cur.fetchone()[0]
         cur.execute(RECOMPUTE_STATS)
         windows_updated = cur.rowcount
+        # 보관 기간 밖으로 밀려난 오래된 행 삭제 (events · item_stats_1m). Parquet 은 건드리지 않는다
+        cur.execute(DELETE_OLD, {"days": retention_days})
+        deleted_events, deleted_stats, latest = cur.fetchone()
         conn.commit()
     return {"staged": staged, "inserted": inserted, "skipped_existing": staged - inserted,
-            "stats_rows_upserted": windows_updated}
+            "stats_rows_upserted": windows_updated,
+            "deleted_events": deleted_events, "deleted_stats": deleted_stats, "latest_event_time": latest}
 
 
 # ----------------------------------------------------------------------
@@ -215,11 +245,14 @@ def make_batch_handler(args):
         (dedup.write.mode("append").partitionBy("dt").parquet(args.parquet_dir))
 
         # --- PostgreSQL: 조회용
-        pg = load_to_postgres(dedup.drop("dt"))
+        pg = load_to_postgres(dedup.drop("dt"), args.pg_retention_days)
 
-        log.info("batch=%d kafka=%d parsed_ok=%d dlq=%d dedup=%d(-%d) | pg inserted=%d skipped_existing=%d stats_upsert=%d | parquet=%s | %.1fs",
+        log.info("batch=%d kafka=%d parsed_ok=%d dlq=%d dedup=%d(-%d) | pg inserted=%d skipped_existing=%d stats_upsert=%d "
+                 "| retention(%dd, latest=%s) deleted events=%d stats=%d | parquet=%s | %.1fs",
                  batch_id, n_raw, n_good, n_bad, n_dedup, n_good - n_dedup,
-                 pg["inserted"], pg["skipped_existing"], pg["stats_rows_upserted"], args.parquet_dir, time.time() - t0)
+                 pg["inserted"], pg["skipped_existing"], pg["stats_rows_upserted"],
+                 args.pg_retention_days, pg["latest_event_time"], pg["deleted_events"], pg["deleted_stats"],
+                 args.parquet_dir, time.time() - t0)
         dedup.unpersist(); raw.unpersist()
     return handle
 
@@ -231,6 +264,8 @@ def main() -> None:
     ap.add_argument("--dlq-topic", default="user-events-dlq")
     ap.add_argument("--parquet-dir", default="data/parquet/events")
     ap.add_argument("--checkpoint", default="checkpoint/preprocess")
+    ap.add_argument("--pg-retention-days", type=int, default=30,
+                    help="PostgreSQL 에 남길 기간(일). 가장 최근 이벤트 시각 기준. Parquet 은 전부 보관")
     ap.add_argument("--continuous", action="store_true", help="1분 트리거로 계속 실행 (기본: 쌓인 것만 처리하고 종료)")
     ap.add_argument("--reset", action="store_true", help="체크포인트를 지우고 토픽 처음부터 다시 처리")
     args = ap.parse_args()
