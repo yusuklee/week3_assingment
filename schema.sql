@@ -1,6 +1,6 @@
 -- PostgreSQL 스키마 (postgres 컨테이너 첫 기동 시 자동 실행)
--- 4회차 범위: events(정제 이벤트), item_stats_1m(1분 집계)
--- 5회차 이후: item_cooccur, recommendations (Airflow 일배치)
+-- 스트리밍(preprocess.py): events(정제 이벤트), item_stats_1m(1분 집계)
+-- 일 배치(dags/dag.py): item_stats_daily(하루 상품 집계), daily_summary(대시보드)
 
 -- ----------------------------------------------------------------------
 -- 정제된 이벤트 원장. 1행 = Kafka 메시지 1건
@@ -49,3 +49,31 @@ CREATE TABLE IF NOT EXISTS item_stats_1m (
     PRIMARY KEY (window_start, item_id)
 );
 CREATE INDEX IF NOT EXISTS idx_item_stats_item ON item_stats_1m (item_id, window_start);
+
+-- ----------------------------------------------------------------------
+-- 일 배치(Airflow) 결과. Parquet 전체 이력에서 계산하므로 30일보다 오래된 날짜도 채울 수 있다
+-- ----------------------------------------------------------------------
+-- 하루 × 상품 집계. DAG 가 그 날짜 행을 DELETE 후 INSERT (한 트랜잭션) → 다시 돌려도 같다
+CREATE TABLE IF NOT EXISTS item_stats_daily (
+    dt               DATE        NOT NULL,             -- 이벤트 날짜 (UTC)
+    item_id          BIGINT      NOT NULL,
+    view_cnt         INT         NOT NULL,
+    addtocart_cnt    INT         NOT NULL,
+    transaction_cnt  INT         NOT NULL,
+    unique_visitors  INT         NOT NULL,
+    PRIMARY KEY (dt, item_id)
+);
+
+-- 대시보드용 하루 요약 1행. 품질 검사를 통과한 날짜만 PK(dt) 로 업서트
+CREATE TABLE IF NOT EXISTS daily_summary (
+    dt               DATE        PRIMARY KEY,
+    events           INT         NOT NULL,
+    view_cnt         INT         NOT NULL,
+    addtocart_cnt    INT         NOT NULL,
+    transaction_cnt  INT         NOT NULL,
+    unique_visitors  INT         NOT NULL,
+    unique_items     INT         NOT NULL,
+    cart_rate        NUMERIC(8,6),                     -- addtocart / view
+    purchase_rate    NUMERIC(8,6),                     -- transaction / view
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);

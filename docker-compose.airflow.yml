@@ -1,0 +1,78 @@
+# Airflow (공식 docker compose 를 로컬 1대용으로 줄인 것: CeleryExecutor/redis 대신 LocalExecutor)
+# 기존 compose 와 같이 띄워야 postgres 서비스 이름으로 접속된다
+#   docker compose -f docker-compose.yml -f docker-compose.airflow.yml up -d
+# UI: http://localhost:8080  (airflow / airflow, 로컬 실습용)
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.10.5
+  user: "50000:0"
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    # DAG 가 쓰는 연결 · 경로
+    AIRFLOW_CONN_CLICKSTREAM_DB: postgresql://clickstream:clickstream@postgres:5432/clickstream
+    PARQUET_EVENTS_DIR: /opt/airflow/data/parquet/events
+    DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}   # 비우면 알림은 로그로만
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./data/parquet:/opt/airflow/data/parquet
+    - airflow_logs:/opt/airflow/logs
+  depends_on: &airflow-depends
+    airflow-db:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
+
+services:
+  airflow-db:
+    image: postgres:16
+    container_name: airflow-db
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    command: version
+    environment:
+      <<: *airflow-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: airflow
+      _AIRFLOW_WWW_USER_PASSWORD: airflow
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    depends_on:
+      <<: *airflow-depends
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    depends_on:
+      <<: *airflow-depends
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  airflow_db:
+  airflow_logs:

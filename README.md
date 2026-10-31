@@ -238,3 +238,148 @@ INFO DONE 쌓인 메시지 처리 완료
 - **1분 집계 재계산 비용.** 배치가 건드린 윈도우만 `events` 에서 다시 세는 방식이라 정확하지만, 한 배치에 윈도우가 많이 들어오면 그만큼 느려진다 (45일치 한 번에: 집계 upsert 887,413행 포함 62초). 로드 테스트에서 측정.
 - **아직 없는 테이블.** `item_cooccur`(함께 본 상품), `recommendations`(유저별 Top-N) 는 Airflow 일배치 몫. 스트리밍에서 30분 세션 self-join 은 상태가 커져서 배치로 뺐다.
 - **환경.** pyspark 3.5.3 은 Python 3.13 에서 워커가 죽어서 3.10 으로 실행. Windows 에서 Spark 종료 시 `snappy-java.jar 삭제 실패` 경고가 뜨는데 임시 파일 정리 문제라 결과에는 영향 없음.
+
+---
+
+## 6. 일 배치 (Airflow)
+
+스트리밍(`preprocess.py`)이 쌓아 둔 하루치 데이터를 매일 한 번 정리 → 집계 → 검사 → 공개하는 DAG (`dags/dag.py`, dag_id `daily_events`).
+스트리밍은 "빨리, 조금씩", 일 배치는 "하루가 끝난 뒤 정확하게" 를 맡는다.
+
+### 6-1. DAG 구조
+
+```
+check_partition ──▶ compact_parquet ──▶ daily_agg ──▶ quality_check ──▶ publish
+   (날짜 확인)        (파일 합치기·중복 제거)  (하루 상품 집계)   (건수·null·중복)     (대시보드 갱신)
+                                   └──── 어느 Task 든 최종 실패하면 → 알림 (on_failure_callback) ────┘
+```
+
+| Task | 하는 일 (한 줄) | 입력 → 출력 | 재시도 |
+|---|---|---|---|
+| `check_partition` | 처리할 날짜를 정하고 그 날짜 Parquet 폴더가 있는지 확인. 없으면 이후 Task 를 건너뜀(skip) | `dt=YYYY-MM-DD/` 존재 여부 | 0 |
+| `compact_parquet` | 그 날짜의 작은 파일들을 하나로 합치고 `event_id` 중복을 지운 뒤 폴더를 통째로 교체 | Parquet 여러 개 → Parquet 1개 | 3 |
+| `daily_agg` | 하루 × 상품별 view · addtocart · transaction · 고유 방문자 수를 다시 계산 | Parquet → PostgreSQL `item_stats_daily` | 3 |
+| `quality_check` | 건수 > 0, 필수 컬럼 null 0, `event_id` 중복 0, 이벤트 종류 · 날짜 범위, 집계 합계 = 원본 건수 | Parquet + `item_stats_daily` → 통과 / 실패 | 0 |
+| `publish` | 검사를 통과한 날짜만 하루 요약 1행을 업서트 | Parquet → PostgreSQL `daily_summary` | 3 |
+
+`daily_agg` 를 PostgreSQL `events` 가 아니라 Parquet 에서 계산하는 이유: `events` 는 최근 30일만 남기 때문. Parquet 은 전체 이력이라 오래된 날짜도 같은 코드로 다시 계산할 수 있다.
+
+**같은 날짜를 두 번 돌려도 결과가 같게 (멱등)**
+
+| 대상 | 방법 |
+|---|---|
+| Parquet `dt=…/` | 새 파일을 `_compact_tmp/` 에 다 쓴 뒤 폴더째 교체 (append 아님). 행을 정렬해서 쓰므로 파일 내용도 매번 같다 |
+| `item_stats_daily` | 한 트랜잭션 안에서 `DELETE WHERE dt = …` + `INSERT` |
+| `daily_summary` | PK(`dt`) 로 `INSERT … ON CONFLICT DO UPDATE` |
+
+`compact_parquet` 가 5-3 의 "Parquet 재처리 중복" 을 날짜 단위로 해결한다. 스트리밍을 처음부터 다시 돌려 같은 이벤트가 또 쌓여도, 그 날짜 DAG 가 돌면 중복이 사라진다.
+
+### 6-2. retry · backoff 전략
+
+기본값: `retries=3`, `retry_delay=1분`, `retry_exponential_backoff=True`, `max_retry_delay=10분` → 대략 1분 → 2분 → 4분 (Airflow 가 약간의 랜덤을 섞는다).
+
+| 구분 | Task | 이유 |
+|---|---|---|
+| 재시도한다 | `compact_parquet`, `daily_agg`, `publish` | 파일 잠금, DB 연결 끊김, 잠깐의 부하처럼 기다리면 풀리는 실패가 대부분 |
+| 재시도 없이 바로 알림 | `quality_check` | 데이터가 틀린 것은 다시 돌려도 똑같이 틀린다. `AirflowFailException` 으로 즉시 실패 |
+| 재시도 없음 | `check_partition` | 폴더가 없으면 실패가 아니라 "처리할 것 없음" → skip. 날짜 형식이 틀리면 바로 실패 |
+
+알림: 재시도를 다 쓰고 최종 실패하면 `on_failure_callback` 이 실행된다. `DISCORD_WEBHOOK_URL` 환경 변수가 있으면 Discord 로 보내고, 없으면 `ALERT` 로그만 남긴다.
+
+### 6-3. 스케줄 · 의존성
+
+| 항목 | 값 |
+|---|---|
+| 실행 시각 | 매일 02:00 UTC (`schedule="0 2 * * *"`) |
+| 처리 날짜 | 실행 전날 하루치 (UTC 00:00 ~ 24:00) = `data_interval_start` 의 날짜. 예: 10/31 02:00 실행 → 10/30 처리 |
+| 시간대 | UTC 로 통일. Spark 가 `dt` 파티션을 UTC 날짜로 만들기 때문 |
+| 왜 02:00 | 자정 직후엔 늦게 도착한 전날 이벤트가 아직 들어올 수 있어서 2시간 여유를 둔다 |
+| 동시 실행 | `max_active_runs=1`. 같은 폴더를 두 실행이 동시에 교체하지 않도록 |
+| catchup | `False`. 켜는 순간 2015년부터 수천 번 실행되는 것을 막는다. 과거 날짜는 backfill 로 |
+
+**리플레이 데이터의 날짜 연결 규칙**: 처리 날짜는 실행 날짜가 아니라 `target_date` 파라미터(없으면 `data_interval_start` 의 날짜)로 정한다. 2015년 데이터는 `target_date` 를 직접 주거나, backfill 의 logical date 를 2015년 날짜로 줘서 처리한다.
+
+**순서의 이유**
+
+1. `check_partition` 이 맨 앞 — 데이터가 없는 날에 뒤 Task 들이 빈 결과를 쓰지 않도록
+2. `compact_parquet` → `daily_agg` — 중복을 지운 파일로 집계해야 숫자가 맞다
+3. `daily_agg` → `quality_check` — 원본과 집계 결과를 둘 다 만든 뒤에 "합계가 같은가" 를 볼 수 있다
+4. `quality_check` → `publish` — 검사에 실패한 날짜는 대시보드에 올라가지 않는다
+
+### 6-4. 실행 방법
+
+```bash
+# 1) Airflow 기동 (공식 docker compose 를 LocalExecutor 로 줄인 것). 기존 compose 와 같이 띄운다
+docker compose -f docker-compose.yml -f docker-compose.airflow.yml up -d
+#    UI: http://localhost:8080  (airflow / airflow)
+
+# 2) 테이블 추가 (postgres 볼륨이 이미 있으면 schema.sql 이 자동 실행되지 않으므로 한 번 직접)
+docker exec -i postgres psql -U clickstream -d clickstream < schema.sql
+
+# 3) DAG 켜기 + 실행
+docker exec airflow-scheduler airflow dags unpause daily_events
+docker exec airflow-scheduler airflow dags trigger daily_events -c '{"target_date": "2015-06-10"}'   # 하루
+docker exec airflow-scheduler airflow dags backfill daily_events -s 2015-05-03 -e 2015-06-18       # 여러 날 (05-03 ~ 06-17, -e 날짜 자체는 안 돈다)
+
+# 4) 결과
+docker exec postgres psql -U clickstream -d clickstream -c "select * from daily_summary order by dt;"
+```
+
+| 구분 | 위치 |
+|---|---|
+| DAG | `dags/dag.py` |
+| Airflow 설정 | `docker-compose.airflow.yml` (메타 DB 는 별도 `airflow-db` 컨테이너) |
+| 입력 | `data/parquet/events/dt=YYYY-MM-DD/` (컨테이너 안 `/opt/airflow/data/parquet/events`) |
+| 출력 | Parquet 같은 폴더 (합친 파일 1개로 교체), PostgreSQL `item_stats_daily`, `daily_summary` |
+
+### 6-5. 실행 결과
+
+**같은 날짜(2015-06-10)를 두 번 실행 → 결과 동일**
+
+```
+              Parquet 파일          item_stats_daily                          daily_summary
+1차 실행      1개 md5 63ea045f8285   13,985행 합계 24,020 md5 851b57b02c1c     24020 view 23213 cart 597 tx 210 방문자 13995
+2차 실행      1개 md5 63ea045f8285   13,985행 합계 24,020 md5 851b57b02c1c     (동일)
+```
+
+1차 실행 로그: `compact files 8 → 1, rows 24020 → 24020` · `daily_agg items=13985` · `quality 전부 0, agg_total=24020`.
+
+**스트리밍 재처리로 중복이 쌓인 상황을 만들고 다시 실행 → 결과 동일**
+
+Spark 가 쓴 원본 파일 하나를 같은 폴더에 다시 넣어 같은 이벤트 2,984건을 중복시킨 뒤 실행:
+`compact files 2 → 1, rows 27004 → 24020, duplicates_removed=2984`. 파일 md5 · 집계 md5 · 요약 모두 1차와 같다.
+
+**품질 검사 실패 → 재시도 없이 바로 알림, 대시보드에는 안 올라감**
+
+2015-06-11 폴더에 `event_type="purchase"` 인 행 1개를 넣고 실행:
+
+```
+quality_check  FAILED  try=1  (Immediate failure requested)
+ALERT `daily_events.quality_check` 실패 (target_date=2015-06-11, try=1)
+      — 품질 검사 실패: ['bad_event_type', 'agg_total != row_count'] {'row_count': 20908, 'bad_event_type': 1, 'agg_total': 20907, ...}
+      (이상한 종류 1건은 집계에서 빠지므로 합계가 원본보다 1 적다 → 두 검사 모두에 걸림)
+publish        upstream_failed
+```
+
+같은 실행에서 `compact_parquet` 는 처음 두 번 실패(테스트 파일을 다른 pyarrow 버전으로 만들어 읽기 오류) → 1분 19초 뒤, 4분 뒤 재시도 → 세 번째에 성공. 재시도 간격이 늘어나는 것도 확인됐다.
+
+**스케줄 실행 (데이터 없는 날)**: 켜자마자 생긴 `scheduled__2026-10-30` 실행은 `dt=2026-10-30` 폴더가 없어서 `check_partition` 이 skip → 나머지도 skip, 실행 상태는 success.
+
+**전체 기간 backfill (2015-05-03 ~ 06-17, 46일)**: 46회 × 5 Task 전부 success, 실행 1회당 약 5초 (총 약 4분).
+
+| 확인 | 결과 |
+|---|---|
+| Parquet | 46개 폴더, 파일 738개 → 46개 (날짜당 1개), 54MB → 50MB, 919,381행 = distinct `event_id` 919,381 |
+| Spark 로 다시 읽기 | `spark.read.parquet` 919,381행, `dt` 와 `event_time` 날짜가 다른 행 0. 합친 파일과 Spark 파일이 섞여도 읽힌다 |
+| `item_stats_daily` | 553,646행, 46일, 합계 919,381 (= Parquet 전체 건수) |
+| `daily_summary` | 46행. 합계 view 889,821 · addtocart 22,307 · transaction 7,253 |
+
+`daily_summary` 는 PostgreSQL `events`(최근 30일) 보다 긴 46일을 다 갖고 있다. Parquet 에서 계산했기 때문.
+
+### 6-6. 남은 문제
+
+- **스트리밍과 동시에 같은 날짜를 건드리면.** `compact_parquet` 가 폴더를 교체하는 사이 Spark 가 그 날짜에 파일을 쓰면 그 파일이 빠질 수 있다. 02:00 에 전날만 처리해서 확률은 낮지만, 막으려면 늦게 온 이벤트를 별도 폴더로 받거나 교체 전에 파일 목록을 다시 확인해야 한다.
+- **품질 검사가 실패해도 앞 단계 결과는 남는다.** 합친 Parquet 과 `item_stats_daily` 는 이미 바뀐 상태이고 `daily_summary` 만 안 바뀐다. 원인을 고치고 그 날짜를 다시 돌리면 덮어써진다.
+- **알림은 웹훅을 넣어야 실제로 간다.** 지금은 `DISCORD_WEBHOOK_URL` 이 비어 있어 `ALERT` 로그로만 확인했다.
+- **추천용 테이블은 아직 없다.** `item_cooccur`(함께 본 상품), `recommendations`(유저별 Top-N) 는 이 DAG 에 `daily_agg` 다음 Task 로 붙이면 된다.
+- **pandas 로 하루치를 메모리에서 처리한다.** 하루 2~3만 건이라 1초 안에 끝나지만, 데이터가 커지면 Spark 작업(`SparkSubmitOperator`)으로 바꿔야 한다.
